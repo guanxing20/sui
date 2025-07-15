@@ -600,14 +600,16 @@ impl AuthorityEpochTables {
         use typed_store::tidehunter_util::{
             default_cells_per_mutex, KeyIndexing, KeySpaceConfig, KeyType, ThConfig,
         };
-        const MUTEXES: usize = 1024;
+        const MUTEXES: usize = 2 * 1024;
         let mut digest_prefix = vec![0; 8];
         digest_prefix[7] = 32;
         const VALUE_CACHE_SIZE: usize = 5000;
         let bloom_config = KeySpaceConfig::new().with_bloom_filter(0.001, 32_000);
         let lru_bloom_config = bloom_config.clone().with_value_cache_size(VALUE_CACHE_SIZE);
         let lru_only_config = KeySpaceConfig::new().with_value_cache_size(VALUE_CACHE_SIZE);
-        let pending_checkpoint_signatures_config = KeySpaceConfig::new().disable_unload();
+        let pending_checkpoint_signatures_config = KeySpaceConfig::new()
+            .disable_unload()
+            .with_value_cache_size(1000);
         let builder_checkpoint_summary_v2_config = pending_checkpoint_signatures_config.clone();
         let object_ref_indexing = KeyIndexing::hash();
         let tx_digest_indexing = KeyIndexing::key_reduction(32, 0..16);
@@ -784,11 +786,7 @@ impl AuthorityEpochTables {
             ),
             (
                 "deferred_transactions".to_string(),
-                ThConfig::new(1 + 8 + 8, MUTEXES, uniform_key),
-            ),
-            (
-                "deferred_transactions".to_string(),
-                ThConfig::new(1 + 8 + 8, MUTEXES, uniform_key),
+                ThConfig::new_with_indexing(KeyIndexing::Hash, MUTEXES, uniform_key),
             ),
             (
                 "dkg_processed_messages_v2".to_string(),
@@ -820,7 +818,7 @@ impl AuthorityEpochTables {
             ),
             (
                 "congestion_control_object_debts".to_string(),
-                ThConfig::new_with_config(32, MUTEXES, uniform_key, bloom_config.clone()),
+                ThConfig::new_with_config(32, MUTEXES, uniform_key, lru_bloom_config.clone()),
             ),
             (
                 "congestion_control_randomness_object_debts".to_string(),
@@ -1089,13 +1087,14 @@ impl AuthorityPerEpochStore {
                         committee.clone(),
                         &*object_store,
                         &metrics,
+                        protocol_params.default_none_duration_for_new_keys,
                     )
                     // Load observations stored during the current epoch.
                     .chain(execution_time_observations.into_iter().flat_map(
                         |((generation, source), observations)| {
-                            observations
-                                .into_iter()
-                                .map(move |(key, duration)| (source, generation, key, duration))
+                            observations.into_iter().map(move |(key, duration)| {
+                                (source, Some(generation), key, duration)
+                            })
                         },
                     )),
                 ))
@@ -1487,7 +1486,15 @@ impl AuthorityPerEpochStore {
         committee: Arc<Committee>,
         object_store: &dyn ObjectStore,
         metrics: &EpochMetrics,
-    ) -> impl Iterator<Item = (AuthorityIndex, u64, ExecutionTimeObservationKey, Duration)> {
+        use_none_generation: bool,
+    ) -> impl Iterator<
+        Item = (
+            AuthorityIndex,
+            Option<u64>,
+            ExecutionTimeObservationKey,
+            Duration,
+        ),
+    > {
         if !matches!(
             protocol_config.per_object_congestion_control_mode(),
             PerObjectCongestionControlMode::ExecutionTimeEstimate(_)
@@ -1550,7 +1557,9 @@ impl AuthorityPerEpochStore {
                             .map(|authority_index| {
                                 (
                                     authority_index,
-                                    0, /* generation */
+                                    // For bug compatibility with previous version, can be
+                                    // removed once set to true on mainnet.
+                                    if use_none_generation { None } else { Some(0) },
                                     key.clone(),
                                     duration,
                                 )
@@ -3207,24 +3216,39 @@ impl AuthorityPerEpochStore {
             .execution_time_estimator
             .try_lock()
             .expect("should only ever be called from the commit handler thread");
-        for (
-            key,
-            ExecutionTimeObservation {
-                authority,
-                generation,
-                estimates,
-            },
-        ) in execution_time_observations
+        // It is ok to just release lock here as functions called by this one are the
+        // only place that transition reconfig state, and this function itself is always
+        // executed from consensus task.
+        if !self
+            .protocol_config()
+            .ignore_execution_time_observations_after_certs_closed()
+            || self
+                .get_reconfig_state_read_lock_guard()
+                .should_accept_consensus_certs()
         {
-            let Some(estimator) = execution_time_estimator.as_mut() else {
-                error!("dropping ExecutionTimeObservation from possibly-Byzantine authority {authority:?} sent when ExecutionTimeEstimate mode is not enabled");
-                continue;
-            };
-            let authority_index = self.committee.authority_index(&authority).unwrap();
-            estimator.process_observations_from_consensus(authority_index, generation, &estimates);
-            output.insert_execution_time_observation(authority_index, generation, estimates);
-            if self.protocol_config().record_time_estimate_processed() {
-                output.record_consensus_message_processed(key);
+            for (
+                key,
+                ExecutionTimeObservation {
+                    authority,
+                    generation,
+                    estimates,
+                },
+            ) in execution_time_observations
+            {
+                let Some(estimator) = execution_time_estimator.as_mut() else {
+                    error!("dropping ExecutionTimeObservation from possibly-Byzantine authority {authority:?} sent when ExecutionTimeEstimate mode is not enabled");
+                    continue;
+                };
+                let authority_index = self.committee.authority_index(&authority).unwrap();
+                estimator.process_observations_from_consensus(
+                    authority_index,
+                    Some(generation),
+                    &estimates,
+                );
+                output.insert_execution_time_observation(authority_index, generation, estimates);
+                if self.protocol_config().record_time_estimate_processed() {
+                    output.record_consensus_message_processed(key);
+                }
             }
         }
 

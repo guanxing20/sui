@@ -162,8 +162,8 @@ mod test {
         // TODO: enable this - right now it causes rocksdb errors when re-opening DBs
         //register_fail_point_if("correlated-crash-process-certificate", || true);
 
-        let test_cluster = build_test_cluster(4, 10000, 1).await;
-        test_simulated_load(test_cluster, 60).await;
+        let test_cluster = build_test_cluster(4, 15000, 1).await;
+        test_simulated_load(test_cluster, 90).await;
     }
 
     #[sim_test(config = "test_config()")]
@@ -824,10 +824,10 @@ mod test {
     }
 
     async fn test_protocol_upgrade_compatibility_impl() {
-        // Override record_time_estimate_processed for protocol version 87 in tests
-        // it is currently set to true in 87 in mainnet only
+        // Override record_time_estimate_processed for protocol versions before 88 in tests
+        // to correct for known issue that appeared on mainnet.
         let _guard = ProtocolConfig::apply_overrides_for_testing(|version, mut config| {
-            if version.as_u64() == 87 {
+            if version.as_u64() <= 87 {
                 config.set_record_time_estimate_processed_for_testing(true);
             }
             config
