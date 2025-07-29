@@ -3,23 +3,24 @@
 
 use std::{sync::Arc, time::Duration};
 
-use rand::seq::SliceRandom as _;
 use sui_types::{
-    base_types::ConciseableName, digests::TransactionDigest, messages_consensus::ConsensusPosition,
-    messages_grpc::RawSubmitTxRequest,
+    base_types::AuthorityName, digests::TransactionDigest, messages_grpc::RawSubmitTxRequest,
 };
 use tokio::time::timeout;
-use tracing::{debug, instrument};
+use tracing::instrument;
 
 use crate::{
     authority_aggregator::AuthorityAggregator,
     authority_client::AuthorityAPI,
+    safe_client::SafeClient,
     transaction_driver::{
-        error::TransactionDriverError, SubmitTransactionOptions, TransactionDriverMetrics,
+        error::{TransactionDriverError, TransactionRequestError},
+        request_retrier::RequestRetrier,
+        SubmitTransactionOptions, SubmitTxResponse, TransactionDriverMetrics,
     },
 };
 
-const SUBMIT_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(2);
+const SUBMIT_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(crate) struct TransactionSubmitter {
     metrics: Arc<TransactionDriverMetrics>,
@@ -30,73 +31,56 @@ impl TransactionSubmitter {
         Self { metrics }
     }
 
-    #[instrument(level = "trace", skip_all, fields(tx_digest = ?tx_digest))]
+    #[instrument(level = "error", skip_all, fields(tx_digest = ?tx_digest))]
     pub(crate) async fn submit_transaction<A>(
         &self,
         authority_aggregator: &Arc<AuthorityAggregator<A>>,
         tx_digest: &TransactionDigest,
         raw_request: RawSubmitTxRequest,
         options: &SubmitTransactionOptions,
-    ) -> Result<ConsensusPosition, TransactionDriverError>
+    ) -> Result<(AuthorityName, SubmitTxResponse), TransactionDriverError>
     where
         A: AuthorityAPI + Send + Sync + 'static + Clone,
     {
-        let mut attempts = 0;
-        // TODO(fastpath): Remove MAX_ATTEMPTS. Retry until f+1 permanent failures or cancellation.
-        const MAX_ATTEMPTS: usize = 10;
-
+        let mut retrier = RequestRetrier::new(authority_aggregator);
+        // This loop terminates when there are enough (f+1) non-retriable errors when submitting the transaction,
+        // or all feasible targets returned errors or timed out.
         loop {
-            attempts += 1;
+            let (name, client) = retrier.next_target()?;
             match self
-                .submit_transaction_once(authority_aggregator, &raw_request, options)
+                .submit_transaction_once(client, &raw_request, options)
                 .await
             {
-                Ok(consensus_position) => {
-                    debug!(
-                        "Transaction {tx_digest} submitted to consensus at position: {consensus_position:?}",
-                    );
+                Ok(resp) => {
                     self.metrics.submit_transaction_success.inc();
-                    return Ok(consensus_position);
+                    return Ok((name, resp));
                 }
                 Err(e) => {
                     self.metrics.submit_transaction_error.inc();
-                    if attempts >= MAX_ATTEMPTS {
-                        return Err(e);
-                    }
-                    tracing::warn!(
-                        "Failed to submit transaction {tx_digest} (attempt {attempts}/{MAX_ATTEMPTS}): {e}",
-                    );
+                    retrier.add_error(name, e)?;
                 }
-            }
+            };
+            tokio::task::yield_now().await;
         }
     }
 
-    #[instrument(level = "trace", skip_all)]
+    #[instrument(level = "error", skip_all)]
     async fn submit_transaction_once<A>(
         &self,
-        authority_aggregator: &Arc<AuthorityAggregator<A>>,
+        client: Arc<SafeClient<A>>,
         raw_request: &RawSubmitTxRequest,
         options: &SubmitTransactionOptions,
-    ) -> Result<ConsensusPosition, TransactionDriverError>
+    ) -> Result<SubmitTxResponse, TransactionRequestError>
     where
         A: AuthorityAPI + Send + Sync + 'static + Clone,
     {
-        let clients = authority_aggregator
-            .authority_clients
-            .iter()
-            .collect::<Vec<_>>();
-        let (name, client) = clients.choose(&mut rand::thread_rng()).unwrap();
-
-        let consensus_position = timeout(
+        let resp = timeout(
             SUBMIT_TRANSACTION_TIMEOUT,
             client.submit_transaction(raw_request.clone(), options.forwarded_client_addr),
         )
         .await
-        .map_err(|_| TransactionDriverError::TimeoutSubmittingTransaction)?
-        .map_err(|e| {
-            TransactionDriverError::RpcFailure(name.concise().to_string(), e.to_string())
-        })?;
-
-        Ok(consensus_position)
+        .map_err(|_| TransactionRequestError::TimedOutSubmittingTransaction)?
+        .map_err(TransactionRequestError::RejectedAtValidator)?;
+        Ok(resp)
     }
 }
